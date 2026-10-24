@@ -1333,11 +1333,21 @@ static void rename_commit(TUI *tui) {
 	DirEntry *e;
 	char old_path[PATH_MAX];
 	char new_path[PATH_MAX];
+	char msg[RENAME_BUF_MAX + 128];
 	UndoOp op;
 
 	if (tui->rename_len == 0 || tui->files.entry_count == 0) { return; }
 	e = &tui->files.entries[tui->files.selected];
 	if (strcmp(e->name, tui->rename_buf) == 0) { return; }
+
+	if (strchr(tui->rename_buf, '/') || strcmp(tui->rename_buf, ".") == 0 || strcmp(tui->rename_buf, "..") == 0) {
+		print_to_shell(&tui->shell, "Rename: invalid name.\n", SHELL_MSG_ERROR);
+		return;
+	}
+	if (tui->rename_len >= MAX_FILENAME) {
+		print_to_shell(&tui->shell, "Rename: name is too long.\n", SHELL_MSG_ERROR);
+		return;
+	}
 
 	if (strcmp(tui->files.cwd, "/") == 0) {
 		snprintf(old_path, PATH_MAX, "/%.*s", (int)(PATH_MAX - 2), e->name);
@@ -1346,19 +1356,18 @@ static void rename_commit(TUI *tui) {
 		path_join(old_path, PATH_MAX, tui->files.cwd, e->name);
 		path_join(new_path, PATH_MAX, tui->files.cwd, tui->rename_buf);
 	}
-	rename(old_path, new_path);
+	if (path_move(old_path, new_path) != 0) {
+		snprintf(msg, sizeof(msg), "Rename failed for '%s': %s\n", tui->rename_buf, strerror(errno));
+		print_to_shell(&tui->shell, msg, SHELL_MSG_ERROR);
+		return;
+	}
 
-	op.type = OP_RENAME;
-	strncpy(op.cwd, tui->files.cwd, PATH_MAX - 1);
-	op.cwd[PATH_MAX - 1] = '\0';
-	strncpy(op.old_name, e->name, MAX_FILENAME - 1);
-	op.old_name[MAX_FILENAME - 1] = '\0';
-	strncpy(op.new_name, tui->rename_buf, MAX_FILENAME - 1);
-	op.new_name[MAX_FILENAME - 1] = '\0';
-	op.trash_path[0] = '\0';
-
+	op = (UndoOp){ .type = OP_RENAME };
+	snprintf(op.cwd, sizeof(op.cwd), "%s", tui->files.cwd);
+	snprintf(op.old_name, sizeof(op.old_name), "%s", e->name);
+	memcpy(op.new_name, tui->rename_buf, (size_t)tui->rename_len + 1);
 	push_undo(&tui->files, op);
-	
+
 	files_load_directory(&tui->files, tui->files.cwd);
 }
 
@@ -1492,10 +1501,24 @@ static void render_delete_confirm(TUI *tui, DeleteMode mode) {
 	int confirmed;
 	int warn_cp;
 	int ch;
+	int has_dir;
 	DirEntry *e;
 	WINDOW *popup;
 
-	e = tui->files.entry_count > 0 ? &tui->files.entries[tui->files.selected] : NULL;
+	// Describe exactly what files_delete_* will act on: the selection if any, otherwise the cursor
+	e = NULL;
+	has_dir = 0;
+	if (tui->files.sel_count > 0) {
+		for (int i = 0; i < tui->files.entry_count; i++) {
+			if (!tui->files.multi_sel[i]) { continue; }
+			if (!e) { e = &tui->files.entries[i]; }
+			if (tui->files.entries[i].type == ENTRY_DIR) { has_dir = 1; }
+		}
+	} else if (tui->files.entry_count > 0) {
+		e = &tui->files.entries[tui->files.selected];
+		has_dir = (e->type == ENTRY_DIR);
+	}
+	if (!e) { return; }
 
 	if (mode == DEL_TRASH) {
 		action = "Trash";
@@ -1505,14 +1528,9 @@ static void render_delete_confirm(TUI *tui, DeleteMode mode) {
 
 	if (tui->files.sel_count > 1) {
 		snprintf(target, sizeof(target), "%d items", tui->files.sel_count);
-	} else if (e) {
-		const char *kind = (e->type == ENTRY_DIR) ? "directory" : "file";
-		snprintf(target, sizeof(target), "'%.30s' (%s)", e->name, kind);
 	} else {
-		return;
+		snprintf(target, sizeof(target), "'%.30s' (%s)", e->name, (e->type == ENTRY_DIR) ? "directory" : "file");
 	}
-
-	int has_dir = (tui->files.sel_count > 1) || (e && e->type == ENTRY_DIR);
 
 	if (mode == DEL_TRASH) {
 		warning = has_dir ? "Directories will be deleted recursively." : NULL;

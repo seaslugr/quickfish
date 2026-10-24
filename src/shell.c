@@ -16,6 +16,7 @@ static void debug_print_jumplist(ShellBuffer *shell);
 static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win);
 static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell);
 static const char *parse_cd(const char *cmd);
+static int rm_entry(FilesBuffer *files, int i);
 
 typedef struct {
 	const char *cmd;
@@ -376,6 +377,17 @@ static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
 	}
 }
 
+static int rm_entry(FilesBuffer *files, int i) {
+	char entry_path[PATH_MAX];
+
+	if (strcmp(files->cwd, "/") == 0) {
+		snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
+	} else {
+		path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+	}
+	return path_remove_tree(entry_path);
+}
+
 static const char *parse_cd(const char *cmd) {
 	const char *after;
 
@@ -428,28 +440,34 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 	int tok_len;
 	int matched;
 	int was_quoted;
-	char entry_path[PATH_MAX];
-	char rm_cmd[PATH_MAX + 16];
+	int removed;
+	int failed;
 	char sel_args[SHELL_MAX_INPUT * 3];
 	const char *srch;
 	char *dst;
 	int rem;
 	int n;
+	int overflow;
 
 	strncpy(cmd, shell->current_input, SHELL_MAX_INPUT - 1);
 	cmd[SHELL_MAX_INPUT - 1] = '\0';
 
 	if (files->sel_count > 0) {
-		files_build_sel_args(files, sel_args, sizeof(sel_args));
+		overflow = files_build_sel_args(files, sel_args, sizeof(sel_args)) < 0;
 		srch = cmd;
 		dst = expanded;
 		rem = (int)sizeof(expanded) - 1;
-		while (*srch && rem > 0) {
+		while (*srch && rem > 0 && !overflow) {
 			if (strncmp(srch, "sel", 3) == 0 &&
 			    (srch == cmd || srch[-1] == ' ') &&
 			    (srch[3] == '\0' || srch[3] == ' ')) {
-				n = snprintf(dst, rem, "%s", sel_args);
-				if (n > 0 && n < rem) { dst += n; rem -= n; }
+				n = snprintf(dst, rem + 1, "%s", sel_args);
+				if (n < 0 || n > rem) {
+					overflow = 1;
+					break;
+				}
+				dst += n;
+				rem -= n;
 				srch += 3;
 			} else {
 				*dst++ = *srch++;
@@ -457,8 +475,12 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 			}
 		}
 		*dst = '\0';
-		strncpy(cmd, expanded, SHELL_MAX_INPUT - 1);
-		cmd[SHELL_MAX_INPUT - 1] = '\0';
+		// Never run a command that was cut short, it could act on the wrong files
+		if (overflow || *srch != '\0' || strlen(expanded) >= SHELL_MAX_INPUT) {
+			print_to_shell(shell, "selection is too large to expand into the command line\n", SHELL_MSG_ERROR);
+			return 0;
+		}
+		memcpy(cmd, expanded, strlen(expanded) + 1);
 	}
 
 	len = (int)strlen(cmd);
@@ -656,6 +678,8 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 			// Phase 2 execute the deletions
 			shell->rm_confirm_mode = 0;
 			any = 0;
+			removed = 0;
+			failed = 0;
 			while (*arg != '\0') {
 				tok_end = arg;
 				while (*tok_end && *tok_end != ' ' && *tok_end != '\t') { tok_end++; }
@@ -674,49 +698,45 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 				arg = tok_end;
 				while (*arg == ' ' || *arg == '\t') { arg++; }
 
-				matched = 0;
+				matched = -1;
 				if (!was_quoted) {
 					idx = strtol(token, &endp, 10);
 					if (*endp == '\0' && idx > 0) {
 						for (int i = 0; i < files->entry_count; i++) {
-							if (files->entries[i].index != (int)idx) { continue; }
-							if (strcmp(files->cwd, "/") == 0) {
-								snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
-							} else {
-								path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+							if (files->entries[i].index == (int)idx) {
+								matched = i;
+								break;
 							}
-							if (files->entries[i].type == ENTRY_DIR) {
-								snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
-							} else {
-								snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
-							}
-							run_shell(rm_cmd, files->cwd, shell);
-							any = 1;
-							matched = 1;
+						}
+					}
+				}
+				if (matched < 0) {
+					for (int i = 0; i < files->entry_count; i++) {
+						if (strcmp(files->entries[i].name, token) == 0) {
+							matched = i;
 							break;
 						}
 					}
 				}
-				if (!matched) {
-					for (int i = 0; i < files->entry_count; i++) {
-						if (strcmp(files->entries[i].name, token) != 0) { continue; }
-						if (strcmp(files->cwd, "/") == 0) {
-							snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
-						} else {
-							path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
-						}
-						if (files->entries[i].type == ENTRY_DIR) {
-							snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
-						} else {
-							snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
-						}
-						run_shell(rm_cmd, files->cwd, shell);
-						any = 1;
-						break;
-					}
+				if (matched < 0) { continue; }
+
+				any = 1;
+				if (rm_entry(files, matched) == 0) {
+					removed++;
+				} else {
+					failed++;
 				}
 			}
-			if (any) { return 0; }
+			if (any) {
+				if (failed > 0) {
+					snprintf(display, sizeof(display), "rm: removed %d, failed to remove %d item(s)\n", removed, failed);
+					print_to_shell(shell, display, SHELL_MSG_ERROR);
+				} else {
+					snprintf(display, sizeof(display), "rm: removed %d item(s)\n", removed);
+					print_to_shell(shell, display, SHELL_MSG_NORMAL);
+				}
+				return 0;
+			}
 		}
 	}
 

@@ -65,6 +65,9 @@ typedef struct {
 struct ShellBuffer;
 
 int dir_is_empty(const char *path);
+int path_exists(const char *path);
+int path_remove_tree(const char *path);
+int path_move(const char *src, const char *dst);
 void files_load_directory(FilesBuffer *files, const char *path);
 void files_sort_entries(FilesBuffer *files);
 void files_select_next(FilesBuffer *files);

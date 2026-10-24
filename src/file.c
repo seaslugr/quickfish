@@ -2,6 +2,8 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +32,9 @@ static void strncpy_safe(char *dst, size_t dst_size, const char *src);
 static void do_trash_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx);
 static void do_delete_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx);
 static int path_is_at_or_below(const char *path, const char *root);
-static int move_entry(const char *src, const char *dst);
+static int remove_walk(const char *path, const struct stat *st, int type, struct FTW *ftw);
+static int mkdir_p(const char *path);
+static int shell_quote_append(char *out, int out_size, int pos, const char *s);
 static void undo_op_path(char *out, size_t out_size, const char *cwd, const char *name);
 static int undo_op_describe(const UndoOp *op, char *out, size_t out_size);
 static void files_print_op_stack(const char *title, const UndoOp *stack, int top,
@@ -437,11 +441,88 @@ static int path_is_at_or_below(const char *path, const char *root) {
 	return path[root_len] == '/';
 }
 
-static int move_entry(const char *src, const char *dst) {
-	if (rename(src, dst) == 0) {
-		return 0;
+int path_exists(const char *path) {
+	struct stat st;
+
+	return lstat(path, &st) == 0;
+}
+
+static int remove_walk(const char *path, const struct stat *st, int type, struct FTW *ftw) {
+	(void)st; (void)type; (void)ftw;
+	return remove(path);
+}
+
+int path_remove_tree(const char *path) {
+	return nftw(path, remove_walk, 64, FTW_DEPTH | FTW_PHYS);
+}
+
+/* Moves src to dst without ever replacing an existing dst. Falls back to
+   mv(1) when src and dst are on different filesystems. Sets errno on failure. */
+int path_move(const char *src, const char *dst) {
+	pid_t pid;
+	int status;
+	int fd;
+
+	if (path_exists(dst)) {
+		errno = EEXIST;
+		return -1;
 	}
-	return -1;
+	if (rename(src, dst) == 0) { return 0; }
+	if (errno != EXDEV) { return -1; }
+
+	pid = fork();
+	if (pid < 0) { return -1; }
+	if (pid == 0) {
+		fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) {
+			dup2(fd, STDIN_FILENO);
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+		}
+		execlp("mv", "mv", "--", src, dst, (char *)NULL);
+		_exit(127);
+	}
+	if (waitpid(pid, &status, 0) < 0) { return -1; }
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		errno = EIO;
+		return -1;
+	}
+	return 0;
+}
+
+static int mkdir_p(const char *path) {
+	char buf[PATH_MAX];
+
+	strncpy_safe(buf, sizeof(buf), path);
+	for (char *p = buf + 1; *p; p++) {
+		if (*p != '/') { continue; }
+		*p = '\0';
+		if (mkdir(buf, 0700) != 0 && errno != EEXIST) { return -1; }
+		*p = '/';
+	}
+	if (mkdir(buf, 0700) != 0 && errno != EEXIST) { return -1; }
+	return 0;
+}
+
+/* Appends s to out wrapped in single quotes, escaping embedded quotes as '\''.
+   Returns the new length, or -1 if it does not fit. */
+static int shell_quote_append(char *out, int out_size, int pos, const char *s) {
+	if (pos + 1 >= out_size) { return -1; }
+	out[pos++] = '\'';
+	for (; *s; s++) {
+		if (*s == '\'') {
+			if (pos + 4 >= out_size) { return -1; }
+			memcpy(out + pos, "'\\''", 4);
+			pos += 4;
+		} else {
+			if (pos + 1 >= out_size) { return -1; }
+			out[pos++] = *s;
+		}
+	}
+	if (pos + 1 >= out_size) { return -1; }
+	out[pos++] = '\'';
+	out[pos] = '\0';
+	return pos;
 }
 
 int entry_color_pair(const DirEntry *e, int selected) {
@@ -878,79 +959,69 @@ static void do_trash_entry(FilesBuffer *files, struct ShellBuffer *shell, int id
 	char entry_path[PATH_MAX];
 	char trash_dir[PATH_MAX];
 	char trash_dest[PATH_MAX];
-	char mkdir_cmd[PATH_MAX + 16];
-	char mv_cmd[PATH_MAX * 2 + 8];
+	char msg[MAX_FILENAME + 128];
 	const char *home;
-	struct stat st;
+	const char *name;
+	long now;
 	UndoOp op;
 
 	if (idx < 0 || idx >= files->entry_count) { return; }
 
-	if (strcmp(files->cwd, "/") == 0) {
-		snprintf(entry_path, PATH_MAX, "/%s", files->entries[idx].name);
-	} else {
-		path_join(entry_path, PATH_MAX, files->cwd, files->entries[idx].name);
-	}
+	name = files->entries[idx].name;
+	undo_op_path(entry_path, sizeof(entry_path), files->cwd, name);
 
 	home = getenv("HOME");
 	if (!home || home[0] == '\0') { home = "/tmp"; }
 	snprintf(trash_dir, sizeof(trash_dir), "%s/.local/share/Trash/files", home);
-	snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", trash_dir);
-	system(mkdir_cmd);
-
-	path_join(trash_dest, sizeof(trash_dest), trash_dir, files->entries[idx].name);
-	if (stat(trash_dest, &st) == 0) {
-		char ts_suffix[24];
-		snprintf(ts_suffix, sizeof(ts_suffix), ".%ld", (long)time(NULL));
-		strncat(trash_dest, ts_suffix, sizeof(trash_dest) - strlen(trash_dest) - 1);
+	if (mkdir_p(trash_dir) != 0) {
+		snprintf(msg, sizeof(msg), "Trash failed: cannot create trash directory (%s).\n", strerror(errno));
+		print_to_shell(shell, msg, SHELL_MSG_ERROR);
+		return;
 	}
 
-	snprintf(mv_cmd, sizeof(mv_cmd), "mv '%s' '%s'", entry_path, trash_dest);
-	system(mv_cmd);
+	path_join(trash_dest, sizeof(trash_dest), trash_dir, name);
+	now = (long)time(NULL);
+	for (int n = 1; path_exists(trash_dest); n++) {
+		if (snprintf(trash_dest, sizeof(trash_dest), "%s/%.200s.%ld.%d", trash_dir, name, now, n) >= (int)sizeof(trash_dest)) {
+			print_to_shell(shell, "Trash failed: trash path is too long.\n", SHELL_MSG_ERROR);
+			return;
+		}
+	}
 
-	op.type = OP_TRASH;
-	strncpy(op.cwd, files->cwd, PATH_MAX - 1);
-	op.cwd[PATH_MAX - 1] = '\0';
-	strncpy(op.old_name, files->entries[idx].name, MAX_FILENAME - 1);
-	op.old_name[MAX_FILENAME - 1] = '\0';
-	op.new_name[0] = '\0';
-	strncpy(op.trash_path, trash_dest, PATH_MAX - 1);
-	op.trash_path[PATH_MAX - 1] = '\0';
+	if (path_move(entry_path, trash_dest) != 0) {
+		snprintf(msg, sizeof(msg), "Trash failed for '%s': %s\n", name, strerror(errno));
+		print_to_shell(shell, msg, SHELL_MSG_ERROR);
+		return;
+	}
 
+	op = (UndoOp){ .type = OP_TRASH };
+	strncpy_safe(op.cwd, sizeof(op.cwd), files->cwd);
+	strncpy_safe(op.old_name, sizeof(op.old_name), name);
+	strncpy_safe(op.trash_path, sizeof(op.trash_path), trash_dest);
 	push_undo(files, op);
-	(void)shell;
 }
 
 static void do_delete_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx) {
 	char entry_path[PATH_MAX];
-	char cmd[PATH_MAX + 16];
+	char msg[MAX_FILENAME + 128];
+	const char *name;
 	UndoOp op;
 
 	if (idx < 0 || idx >= files->entry_count) { return; }
 
-	if (strcmp(files->cwd, "/") == 0) {
-		snprintf(entry_path, PATH_MAX, "/%s", files->entries[idx].name);
-	} else {
-		path_join(entry_path, PATH_MAX, files->cwd, files->entries[idx].name);
+	name = files->entries[idx].name;
+	undo_op_path(entry_path, sizeof(entry_path), files->cwd, name);
+
+	if (path_remove_tree(entry_path) != 0) {
+		snprintf(msg, sizeof(msg), "Delete failed for '%s': %s\n", name, strerror(errno));
+		print_to_shell(shell, msg, SHELL_MSG_ERROR);
+		return;
 	}
 
-	op.type = OP_DELETE_PERM;
-	strncpy(op.cwd, files->cwd, PATH_MAX - 1);
-	op.cwd[PATH_MAX - 1] = '\0';
-	strncpy(op.old_name, files->entries[idx].name, MAX_FILENAME - 1);
-	op.old_name[MAX_FILENAME - 1] = '\0';
-	op.new_name[0] = '\0';
-	op.trash_path[0] = '\0';
-
-	if (files->entries[idx].type == ENTRY_DIR) {
-		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", entry_path);
-	} else {
-		snprintf(cmd, sizeof(cmd), "rm -f '%s'", entry_path);
-	}
-	system(cmd);
-
+	op = (UndoOp){ .type = OP_DELETE_PERM };
+	strncpy_safe(op.cwd, sizeof(op.cwd), files->cwd);
+	strncpy_safe(op.old_name, sizeof(op.old_name), name);
 	push_undo(files, op);
-	(void)shell;
 }
 
 void files_toggle_select(FilesBuffer *files, int idx) {
@@ -995,21 +1066,26 @@ void files_delete_permanent(FilesBuffer *files, struct ShellBuffer *shell) {
 	}
 }
 
+/* Writes the multi-selected names to out as shell-quoted, space-separated args.
+   Returns the length written, or -1 if the selection does not fit. */
 int files_build_sel_args(FilesBuffer *files, char *out, int out_size) {
 	int written;
-	int n;
 
+	if (out_size <= 0) { return -1; }
 	written = 0;
+	out[0] = '\0';
 	for (int i = 0; i < files->entry_count; i++) {
 		if (!files->multi_sel[i]) { continue; }
-		if (written > 0 && written < out_size - 1) {
+		if (written > 0) {
+			if (written + 1 >= out_size) { return -1; }
 			out[written++] = ' ';
 		}
-		n = snprintf(out + written, out_size - written, "'%s'", files->entries[i].name);
-		if (n > 0) { written += n; }
-		if (written >= out_size - 1) { break; }
+		written = shell_quote_append(out, out_size, written, files->entries[i].name);
+		if (written < 0) {
+			out[0] = '\0';
+			return -1;
+		}
 	}
-	out[written] = '\0';
 	return written;
 }
 
@@ -1017,8 +1093,7 @@ void files_undo(FilesBuffer *files, struct ShellBuffer *shell) {
 	UndoOp op;
 	char old_path[PATH_MAX];
 	char new_path[PATH_MAX];
-	char restore_cmd[PATH_MAX * 2 + 16];
-	char msg[MAX_FILENAME * 2 + 64];
+	char msg[MAX_FILENAME * 2 + 128];
 	int bid;
 
 	if (files->undo_top == 0) {
@@ -1044,9 +1119,12 @@ void files_undo(FilesBuffer *files, struct ShellBuffer *shell) {
 				path_join(old_path, PATH_MAX, op.cwd, op.new_name);
 				path_join(new_path, PATH_MAX, op.cwd, op.old_name);
 			}
-			if (rename(old_path, new_path) == 0) {
+			if (path_move(old_path, new_path) == 0) {
 				snprintf(msg, sizeof(msg), "Undo rename: '%.255s' -> '%.255s'\n", op.new_name, op.old_name);
 				print_to_shell(shell, msg, SHELL_MSG_NORMAL);
+			} else {
+				snprintf(msg, sizeof(msg), "Undo rename failed for '%.255s': %s\n", op.new_name, strerror(errno));
+				print_to_shell(shell, msg, SHELL_MSG_ERROR);
 			}
 			break;
 		case OP_TRASH:
@@ -1059,12 +1137,11 @@ void files_undo(FilesBuffer *files, struct ShellBuffer *shell) {
 			} else {
 				path_join(old_path, PATH_MAX, op.cwd, op.old_name);
 			}
-			snprintf(restore_cmd, sizeof(restore_cmd), "mv '%s' '%s'", op.trash_path, old_path);
-			if (system(restore_cmd) == 0) {
+			if (path_move(op.trash_path, old_path) == 0) {
 				snprintf(msg, sizeof(msg), "Restored '%s' from trash.\n", op.old_name);
 				print_to_shell(shell, msg, SHELL_MSG_NORMAL);
 			} else {
-				snprintf(msg, sizeof(msg), "Restore failed for '%s'.\n", op.old_name);
+				snprintf(msg, sizeof(msg), "Restore failed for '%s': %s\n", op.old_name, strerror(errno));
 				print_to_shell(shell, msg, SHELL_MSG_ERROR);
 			}
 			break;
@@ -1078,11 +1155,11 @@ void files_undo(FilesBuffer *files, struct ShellBuffer *shell) {
 			} else {
 				path_join(old_path, PATH_MAX, op.cwd, op.old_name);
 			}
-			if (rename(old_path, op.trash_path) == 0) {
+			if (path_move(old_path, op.trash_path) == 0) {
 				snprintf(msg, sizeof(msg), "Undo move: restored '%s'.\n", op.old_name);
 				print_to_shell(shell, msg, SHELL_MSG_NORMAL);
 			} else {
-				snprintf(msg, sizeof(msg), "Undo move failed: '%s'.\n", op.old_name);
+				snprintf(msg, sizeof(msg), "Undo move failed for '%s': %s\n", op.old_name, strerror(errno));
 				print_to_shell(shell, msg, SHELL_MSG_ERROR);
 			}
 			break;
@@ -1096,7 +1173,7 @@ void files_redo(FilesBuffer *files, struct ShellBuffer *shell) {
 	UndoOp op;
 	char old_path[PATH_MAX];
 	char new_path[PATH_MAX];
-	char msg[MAX_FILENAME * 2 + 64];
+	char msg[MAX_FILENAME * 2 + 128];
 	int bid;
 
 	if (files->redo_top == 0) {
@@ -1122,9 +1199,12 @@ void files_redo(FilesBuffer *files, struct ShellBuffer *shell) {
 				path_join(old_path, PATH_MAX, op.cwd, op.old_name);
 				path_join(new_path, PATH_MAX, op.cwd, op.new_name);
 			}
-			if (rename(old_path, new_path) == 0) {
+			if (path_move(old_path, new_path) == 0) {
 				snprintf(msg, sizeof(msg), "Redo rename: '%.255s' -> '%.255s'\n", op.old_name, op.new_name);
 				print_to_shell(shell, msg, SHELL_MSG_NORMAL);
+			} else {
+				snprintf(msg, sizeof(msg), "Redo rename failed for '%.255s': %s\n", op.old_name, strerror(errno));
+				print_to_shell(shell, msg, SHELL_MSG_ERROR);
 			}
 			break;
 		case OP_TRASH:
@@ -1141,11 +1221,11 @@ void files_redo(FilesBuffer *files, struct ShellBuffer *shell) {
 			} else {
 				path_join(new_path, PATH_MAX, op.cwd, op.old_name);
 			}
-			if (rename(op.trash_path, new_path) == 0) {
+			if (path_move(op.trash_path, new_path) == 0) {
 				snprintf(msg, sizeof(msg), "Redo move: '%s' moved.\n", op.old_name);
 				print_to_shell(shell, msg, SHELL_MSG_NORMAL);
 			} else {
-				snprintf(msg, sizeof(msg), "Redo move failed: '%s'.\n", op.old_name);
+				snprintf(msg, sizeof(msg), "Redo move failed for '%s': %s\n", op.old_name, strerror(errno));
 				print_to_shell(shell, msg, SHELL_MSG_ERROR);
 			}
 			break;
@@ -1408,7 +1488,7 @@ void files_move_clear(FilesBuffer *files, struct ShellBuffer *shell) {
 void files_move_paste(FilesBuffer *files, struct ShellBuffer *shell, const char *dest) {
 	char src[PATH_MAX];
 	char dst[PATH_MAX];
-	char msg[PATH_MAX + 64];
+	char msg[PATH_MAX + 128];
 	int keep[MOVE_REGISTER_MAX];
 	int any_kept;
 	int any_moved;
@@ -1468,11 +1548,9 @@ void files_move_paste(FilesBuffer *files, struct ShellBuffer *shell, const char 
 			continue;
 		}
 
-		if (move_entry(src, dst) == 0) {
-			op.type = OP_MOVE;
-			op.batch_id = files->move_batch_id;
+		if (path_move(src, dst) == 0) {
+			op = (UndoOp){ .type = OP_MOVE, .batch_id = files->move_batch_id };
 			strncpy_safe(op.old_name, sizeof(op.old_name), base);
-			op.new_name[0] = '\0';
 			snprintf(op.cwd, sizeof(op.cwd), "%s", dest);
 			snprintf(op.trash_path, sizeof(op.trash_path), "%s", src);
 			push_undo(files, op);
@@ -1480,7 +1558,7 @@ void files_move_paste(FilesBuffer *files, struct ShellBuffer *shell, const char 
 			print_to_shell(shell, msg, SHELL_MSG_NORMAL);
 			any_moved = 1;
 		} else {
-			snprintf(msg, sizeof(msg), "Move failed: '%s'\n", base);
+			snprintf(msg, sizeof(msg), "Move failed for '%s': %s\n", base, strerror(errno));
 			print_to_shell(shell, msg, SHELL_MSG_ERROR);
 			keep[i] = 1;
 			any_kept = 1;

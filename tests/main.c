@@ -8,6 +8,7 @@ int tests_failed = 0;
 void test_main();
 void test_file();
 void test_shell();
+void test_safety();
 
 int main() {
 	int total;
@@ -17,6 +18,7 @@ int main() {
 	test_main();
 	test_file();
 	test_shell();
+	test_safety();
 
 	total = tests_passed + tests_failed;
 	if (tests_failed == 0) {
