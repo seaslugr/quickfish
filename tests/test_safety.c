@@ -1,63 +1,27 @@
 #define _XOPEN_SOURCE 700
 
-#include "test.h"
-#include "../src/file.h"
-#include "../src/main.h"
-#include "../src/shell.h"
-
-#include <fcntl.h>
-#include <ftw.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "test.h"
+#include "fixture.h"
+#include "../src/command.h"
+#include "../src/fs.h"
+#include "../src/ops.h"
+#include "../src/util.h"
+
 #define EVIL_NAME "x'; touch PWNED; '"
 
-static int unlink_cb(const char *path, const struct stat *st, int type, struct FTW *ftwbuf);
-static void remove_tree(const char *path);
-static void write_file(const char *path, const char *data);
 static int select_named(FilesBuffer *files, const char *name);
-static int index_of(FilesBuffer *files, const char *name);
 
 static FilesBuffer files;
 static ShellBuffer shell;
 
-static int unlink_cb(const char *path, const struct stat *st, int type, struct FTW *ftwbuf) {
-	(void)st;
-	(void)type;
-	(void)ftwbuf;
-	return remove(path);
-}
-
-static void remove_tree(const char *path) {
-	nftw(path, unlink_cb, 16, FTW_DEPTH | FTW_PHYS);
-}
-
-static void write_file(const char *path, const char *data) {
-	int fd;
-
-	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-	if (fd >= 0) {
-		if (data) {
-			write(fd, data, strlen(data));
-		}
-		close(fd);
-	}
-}
-
-static int index_of(FilesBuffer *files, const char *name) {
-	for (int i = 0; i < files->entry_count; i++) {
-		if (strcmp(files->entries[i].name, name) == 0) {
-			return i;
-		}
-	}
-	return -1;
-}
-
 static int select_named(FilesBuffer *files, const char *name) {
 	int i;
 
-	i = index_of(files, name);
+	i = fixture_index_of(files, name);
 	if (i >= 0) {
 		files_toggle_select(files, i);
 	}
@@ -75,7 +39,9 @@ void test_safety() {
 	char out[64];
 	char long_name[201];
 	char *old_home;
+	char line[64];
 	struct stat st;
+	TUI *tui;
 	int idx;
 	int rc;
 
@@ -92,8 +58,8 @@ void test_safety() {
 
 	path_join(path, sizeof(path), root, "a");
 	path_join(other, sizeof(other), root, "b");
-	write_file(path, "a");
-	write_file(other, "bb");
+	fixture_write_file(path, "a");
+	fixture_write_file(other, "bb");
 	rc = path_move(path, other);
 	CHECK(rc != 0, "refuses to overwrite an existing destination");
 	CHECK(stat(other, &st) == 0 && st.st_size == 2, "existing destination is left intact");
@@ -107,7 +73,8 @@ void test_safety() {
 	SUITE("files_build_sel_args quoting");
 
 	path_join(path, sizeof(path), root, "it's");
-	write_file(path, NULL);
+	fixture_write_file(path, NULL);
+	files_free(&files);
 	memset(&files, 0, sizeof(files));
 	files_load_directory(&files, root);
 	select_named(&files, "it's");
@@ -126,13 +93,14 @@ void test_safety() {
 	setenv("HOME", home, 1);
 
 	path_join(path, sizeof(path), root, EVIL_NAME);
-	write_file(path, NULL);
+	fixture_write_file(path, NULL);
+	files_free(&files);
 	memset(&files, 0, sizeof(files));
 	memset(&shell, 0, sizeof(shell));
 	files_load_directory(&files, root);
-	files.selected = index_of(&files, EVIL_NAME);
-	CHECK(files.selected >= 0, "loads hostile filename");
-	files_delete_to_trash(&files, &shell);
+	idx = fixture_index_of(&files, EVIL_NAME);
+	CHECK(idx >= 0, "loads hostile filename");
+	files_trash_entries(&files, &shell, &idx, 1);
 	CHECK(stat(pwned, &st) != 0, "trash does not execute filename as shell");
 	CHECK(stat(path, &st) != 0, "trash removes the entry from its directory");
 	path_join(trash_dir, sizeof(trash_dir), home, ".local/share/Trash/files");
@@ -144,10 +112,10 @@ void test_safety() {
 	CHECK(stat(path, &st) == 0, "undo restores the trashed entry");
 	CHECK(stat(pwned, &st) != 0, "undo does not execute filename as shell");
 
-	write_file(other, NULL);
+	fixture_write_file(other, NULL);
 	files_load_directory(&files, root);
-	files.selected = index_of(&files, EVIL_NAME);
-	files_delete_to_trash(&files, &shell);
+	idx = fixture_index_of(&files, EVIL_NAME);
+	files_trash_entries(&files, &shell, &idx, 1);
 	CHECK(stat(other, &st) == 0 && stat(path, &st) != 0, "name collision in trash keeps both entries");
 
 	if (old_home) {
@@ -162,13 +130,13 @@ void test_safety() {
 	path_join(path, sizeof(path), root, EVIL_NAME);
 	mkdir(path, 0755);
 	path_join(other, sizeof(other), path, "inner");
-	write_file(other, NULL);
+	fixture_write_file(other, NULL);
 	path_join(other, sizeof(other), root, "keep");
-	write_file(other, NULL);
+	fixture_write_file(other, NULL);
 	files_load_directory(&files, root);
-	files.selected = index_of(&files, EVIL_NAME);
+	idx = fixture_index_of(&files, EVIL_NAME);
 	files.undo_top = 0;
-	files_delete_permanent(&files, &shell);
+	files_delete_entries(&files, &shell, &idx, 1);
 	CHECK(stat(path, &st) != 0, "deletes directory recursively");
 	CHECK(stat(other, &st) == 0, "leaves sibling entries alone");
 	CHECK(stat(pwned, &st) != 0, "delete does not execute filename as shell");
@@ -178,67 +146,65 @@ void test_safety() {
 	path_join(path, sizeof(path), root, "locked");
 	mkdir(path, 0755);
 	path_join(other, sizeof(other), path, "inner");
-	write_file(other, NULL);
+	fixture_write_file(other, NULL);
 	chmod(path, 0555);
 	files_load_directory(&files, root);
-	files.selected = index_of(&files, "locked");
+	idx = fixture_index_of(&files, "locked");
 	files.undo_top = 0;
 	memset(&shell, 0, sizeof(shell));
-	files_delete_permanent(&files, &shell);
+	files_delete_entries(&files, &shell, &idx, 1);
 	if (geteuid() != 0) {
 		CHECK(files.undo_top == 0, "failed delete does not record an undo op");
 		CHECK(strstr(shell.last_output + 1, "Delete failed") != NULL, "failed delete prints an error");
 	}
 	chmod(path, 0755);
-	remove_tree(path);
+	fixture_remove_tree(path);
 
 	SUITE("shell rm with hostile filename");
 
 	path_join(path, sizeof(path), root, EVIL_NAME);
-	write_file(path, NULL);
-	files_load_directory(&files, root);
-	idx = index_of(&files, EVIL_NAME);
-	memset(&shell, 0, sizeof(shell));
-	shell.rm_confirm_mode = 1;
-	snprintf(shell.current_input, sizeof(shell.current_input), "rm %d", files.entries[idx].index);
-	execute_given(&shell, &files, NULL, NULL);
+	fixture_write_file(path, NULL);
+	tui = fixture_tui_new(root);
+	idx = fixture_index_of(&tui->files, EVIL_NAME);
+	snprintf(line, sizeof(line), "rm %d", tui->files.entries[idx].index);
+	cmd_run(tui, line, 0, 0);
 	CHECK(stat(path, &st) != 0, "confirmed rm removes the indexed entry");
 	CHECK(stat(pwned, &st) != 0, "rm does not execute filename as shell");
-	CHECK(strstr(shell.last_output + 1, "removed 1") != NULL, "rm reports what it removed");
+	CHECK(strstr(tui->shell.last_output, "Deleted 1 item(s)") != NULL, "rm reports what it removed");
 
-	SUITE("sel expansion");
+	SUITE("sel and cur expansion");
 
-	path_join(path, sizeof(path), root, EVIL_NAME);
-	write_file(path, NULL);
-	files_load_directory(&files, root);
-	select_named(&files, EVIL_NAME);
-	memset(&shell, 0, sizeof(shell));
-	snprintf(shell.current_input, sizeof(shell.current_input), "ls sel");
-	execute_given(&shell, &files, NULL, NULL);
+	fixture_write_file(path, NULL);
+	tui_refresh_files(tui);
+	select_named(&tui->files, EVIL_NAME);
+	cmd_run(tui, "ls sel", 0, 0);
 	CHECK(stat(pwned, &st) != 0, "sel expansion does not execute filename as shell");
+	tui->files.selected = fixture_index_of(&tui->files, EVIL_NAME);
+	cmd_run(tui, "!ls cur", 0, 0);
+	CHECK(stat(pwned, &st) != 0, "cur expansion does not execute filename as shell");
 	unlink(path);
 
 	memset(long_name, 'n', sizeof(long_name) - 1);
 	long_name[sizeof(long_name) - 1] = '\0';
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 12; i++) {
 		long_name[0] = (char)('a' + i);
 		path_join(path, sizeof(path), root, long_name);
-		write_file(path, NULL);
+		fixture_write_file(path, NULL);
 	}
-	files_load_directory(&files, root);
-	for (int i = 0; i < 3; i++) {
+	tui_refresh_files(tui);
+	for (int i = 0; i < 12; i++) {
 		long_name[0] = (char)('a' + i);
-		select_named(&files, long_name);
+		select_named(&tui->files, long_name);
 	}
-	memset(&shell, 0, sizeof(shell));
-	snprintf(shell.current_input, sizeof(shell.current_input), "touch MARKER sel");
-	execute_given(&shell, &files, NULL, NULL);
+	cmd_run(tui, "touch MARKER sel", 0, 0);
 	path_join(path, sizeof(path), root, "MARKER");
 	CHECK(stat(path, &st) != 0, "oversized sel expansion is not run truncated");
-	CHECK(strstr(shell.last_output + 1, "too large") != NULL, "oversized sel expansion prints an error");
+	CHECK(strstr(tui->shell.last_output, "too large") != NULL, "oversized sel expansion prints an error");
+	fixture_tui_free(tui);
 
 	if (old_cwd[0]) {
 		chdir(old_cwd);
 	}
-	remove_tree(root);
+	files_free(&files);
+	fixture_remove_tree(root);
 }

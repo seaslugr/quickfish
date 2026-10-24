@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>foox.dev@gmail.com</email>
+		<name>seaslug</name>
+	</maintainer>
+	<upstream>
+		<remote-id type="github">seaslugr/quickfish</remote-id>
+	</upstream>
+</pkgmetadata>

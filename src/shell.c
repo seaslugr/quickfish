@@ -5,78 +5,31 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "main.h"
+#include "fs.h"
 #include "shell.h"
+#include "util.h"
 
-static const char *lookup_label(const char *cmd);
-static void strncpy_safe(char *dst, size_t dst_size, const char *src);
-static void copy_span(char *dst, size_t dst_size, const char *src, size_t len);
 static void jumplist_push(ShellBuffer *shell, const char *path);
-static void debug_print_jumplist(ShellBuffer *shell);
-static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win);
-static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell);
-static const char *parse_cd(const char *cmd);
-static int rm_entry(FilesBuffer *files, int i);
-
-typedef struct {
-	const char *cmd;
-	const char *label;
-} CmdLabel;
-
-/**
- Command labels and ghosts for the shell (and quickshell). The label is used to match the command, and the ghost is the text shown once the label is matched. For example, if the user types "s" and the label is "s", the ghost "> stat <file/index>" will be shown after that command.
- */
-static const CmdLabel cmd_labels[] = {
-	{ "q", "quit" },
-	{ "$jumplist", "print directory jumplist" },
-	{ "$move", "print move register" },
-	{ "$undo", "print undo stack" },
-	{ "$redo", "print redo stack" },
-	{ "swordfish", "it's my brother, no way!" },
-	{ "s", "stat <file/index>" },
-	{ NULL, NULL }
-};
-
-static const char *lookup_label(const char *cmd) {
-	const char *c;
-	size_t len;
-
-	while (*cmd == ' ' || *cmd == '\t') { cmd++; }
-	for (int i = 0; cmd_labels[i].cmd != NULL; i++) {
-		c = cmd_labels[i].cmd;
-		len = strlen(c);
-		if (strncmp(cmd, c, len) == 0 &&
-		    (cmd[len] == '\0' || cmd[len] == ' ' || cmd[len] == '\t')) {
-			return cmd_labels[i].label;
-		}
-	}
-	return NULL;
-}
-
-static void strncpy_safe(char *dst, size_t dst_size, const char *src) {
-	size_t len;
-
-	if (dst_size == 0) { return; }
-	len = strlen(src);
-	if (len >= dst_size) { len = dst_size - 1; }
-	memcpy(dst, src, len);
-	dst[len] = '\0';
-}
-
-static void copy_span(char *dst, size_t dst_size, const char *src, size_t len) {
-	if (dst_size == 0) { return; }
-	if (len >= dst_size) { len = dst_size - 1; }
-	if (len > 0) {
-		memcpy(dst, src, len);
-	}
-	dst[len] = '\0';
-}
+static void log_make_room(ShellBuffer *shell, size_t need);
+static void log_write(ShellBuffer *shell, const char *data, size_t len);
+static void log_begin(ShellBuffer *shell, int type);
+static void log_end(ShellBuffer *shell);
 
 static void jumplist_push(ShellBuffer *shell, const char *path) {
-	if (shell->dir_jumplist_count < DIR_JUMPLIST_MAX) {
-		strncpy_safe(shell->dir_jumplist[shell->dir_jumplist_count], PATH_MAX, path);
-		shell->dir_jumplist_count++;
+	if (shell->dir_jumplist_count >= DIR_JUMPLIST_MAX) {
+		memmove(shell->dir_jumplist[0], shell->dir_jumplist[1], (size_t)(DIR_JUMPLIST_MAX - 1) * PATH_MAX);
+		shell->dir_jumplist_count = DIR_JUMPLIST_MAX - 1;
 	}
+	str_copy(shell->dir_jumplist[shell->dir_jumplist_count], PATH_MAX, path);
+	shell->dir_jumplist_count++;
+}
+
+/* Pops the most recent directory off the jumplist into out. Returns 0 when it is empty. */
+int shell_pop_dir(ShellBuffer *shell, char *out, size_t out_size) {
+	if (shell->dir_jumplist_count <= 0) { return 0; }
+	shell->dir_jumplist_count--;
+	str_copy(out, out_size, shell->dir_jumplist[shell->dir_jumplist_count]);
+	return 1;
 }
 
 void shell_push_dir(ShellBuffer *shell, const char *path) {
@@ -96,7 +49,7 @@ void shell_add_history(ShellBuffer *shell, const char *cmd) {
 		        (size_t)(SHELL_MAX_HIST - 1) * SHELL_MAX_INPUT);
 		shell->history_count = SHELL_MAX_HIST - 1;
 	}
-	strncpy_safe(shell->history[shell->history_count], SHELL_MAX_INPUT, cmd);
+	str_copy(shell->history[shell->history_count], SHELL_MAX_INPUT, cmd);
 	shell->history_count++;
 }
 
@@ -236,7 +189,7 @@ void shell_tab_complete(ShellBuffer *shell, const char *cwd) {
 void shell_restore_ncurses(WINDOW *files_win, WINDOW *shell_win) {
 	reset_prog_mode();
 	keypad(stdscr, TRUE);
-	nodelay(stdscr, TRUE);
+	timeout(INPUT_TIMEOUT_MS);
 
 	if (files_win) { keypad(files_win, TRUE); }
 	if (shell_win) { keypad(shell_win, TRUE); }
@@ -249,24 +202,7 @@ void shell_restore_ncurses(WINDOW *files_win, WINDOW *shell_win) {
 	if (shell_win) { clearok(shell_win, TRUE); touchwin(shell_win); }
 }
 
-int shell_jump_prev_dir(ShellBuffer *shell, FilesBuffer *files) {
-	const char *prev;
-	const char *slash;
-	const char *dname;
-
-	if (shell->dir_jumplist_count <= 0) {
-		return 0;
-	}
-
-	prev = shell->dir_jumplist[--shell->dir_jumplist_count];
-	slash = strrchr(prev, '/');
-	dname = (slash && slash[1] != '\0') ? slash + 1 : prev;
-	strncpy_safe(shell->last_result, sizeof(shell->last_result), dname);
-	files_load_directory(files, prev);
-	return 1;
-}
-
-static void debug_print_jumplist(ShellBuffer *shell) {
+void shell_print_jumplist(ShellBuffer *shell) {
 	char display[SHELL_OUTPUT_MAX];
 	int pos;
 	int n;
@@ -303,7 +239,7 @@ static void debug_print_jumplist(ShellBuffer *shell) {
 	print_to_shell(shell, display, SHELL_MSG_NORMAL);
 }
 
-static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win) {
+void shell_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win) {
 	const char *sh;
 	pid_t pid;
 	int status;
@@ -329,16 +265,20 @@ static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win) {
 	shell_restore_ncurses(files_win, shell_win);
 }
 
-static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
+void shell_run(ShellBuffer *shell, const char *cmd, const char *cwd) {
 	int pfd[2];
 	const char *sh;
 	pid_t pid;
-	int total;
-	char buf[512];
+	char buf[4096];
+	char msg[64];
 	ssize_t n;
 	int status;
+	int started;
 
-	shell->last_output[0] = '\0';
+	log_begin(shell, SHELL_MSG_CMD);
+	log_write(shell, "$ ", 2);
+	log_write(shell, cmd, strlen(cmd));
+	log_end(shell);
 
 	if (pipe(pfd) != 0) { return; }
 
@@ -362,507 +302,105 @@ static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
 	close(pfd[1]);
 
 	if (pid > 0) {
-		total = 0;
+		started = 0;
 		while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
-			if (total + n < SHELL_OUTPUT_MAX - 1) {
-				memcpy(shell->last_output + total, buf, (size_t)n);
-				total += n;
+			if (!started) {
+				log_begin(shell, SHELL_MSG_NORMAL);
+				started = 1;
 			}
+			log_write(shell, buf, (size_t)n);
 		}
-		shell->last_output[total] = '\0';
+		if (started) { log_end(shell); }
 		close(pfd[0]);
-		waitpid(pid, &status, 0);
+		if (waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+			snprintf(msg, sizeof(msg), "exit status %d\n", WEXITSTATUS(status));
+			print_to_shell(shell, msg, SHELL_MSG_WARN);
+		}
 	} else {
 		close(pfd[0]);
 	}
 }
 
-static int rm_entry(FilesBuffer *files, int i) {
-	char entry_path[PATH_MAX];
+/* Drops whole lines from the front of the log until need more bytes fit. */
+static void log_make_room(ShellBuffer *shell, size_t need) {
+	size_t drop;
+	const char *nl;
 
-	if (strcmp(files->cwd, "/") == 0) {
-		snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
-	} else {
-		path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+	if ((size_t)shell->output_len + need + 1 <= SHELL_LOG_MAX) { return; }
+	drop = (size_t)shell->output_len + need + 1 - SHELL_LOG_MAX;
+	nl = (drop < (size_t)shell->output_len) ? memchr(shell->last_output + drop, '\n', (size_t)shell->output_len - drop) : NULL;
+	if (!nl) {
+		shell_clear_output(shell);
+		return;
 	}
-	return path_remove_tree(entry_path);
+	drop = (size_t)(nl + 1 - shell->last_output);
+	memmove(shell->last_output, shell->last_output + drop, (size_t)shell->output_len - drop + 1);
+	shell->output_len -= (int)drop;
 }
 
-static const char *parse_cd(const char *cmd) {
-	const char *after;
+static void log_write(ShellBuffer *shell, const char *data, size_t len) {
+	if (len > SHELL_LOG_MAX - 2) {
+		data += len - (SHELL_LOG_MAX - 2);
+		len = SHELL_LOG_MAX - 2;
+	}
+	log_make_room(shell, len);
+	memcpy(shell->last_output + shell->output_len, data, len);
+	shell->output_len += (int)len;
+	shell->last_output[shell->output_len] = '\0';
+}
 
-	while (*cmd == ' ' || *cmd == '\t') { cmd++; }
-	if (strncmp(cmd, "cd", 2) != 0) { return NULL; }
-	after = cmd + 2;
-	if (*after != '\0' && *after != ' ' && *after != '\t') { return NULL; }
-	while (*after == ' ' || *after == '\t') { after++; }
-	return after;
+/* Starts a new message. Its type byte colors every line until the next message. */
+static void log_begin(ShellBuffer *shell, int type) {
+	char t;
+
+	log_end(shell);
+	t = (char)type;
+	log_write(shell, &t, 1);
+}
+
+static void log_end(ShellBuffer *shell) {
+	if (shell->output_len > 0 && shell->last_output[shell->output_len - 1] != '\n') {
+		log_write(shell, "\n", 1);
+	}
+}
+
+void shell_clear_output(ShellBuffer *shell) {
+	shell->output_len = 0;
+	shell->last_output[0] = '\0';
 }
 
 int print_to_shell(ShellBuffer *shell, const char *text, int type) {
-	char formatted[SHELL_OUTPUT_MAX];
-
+	log_begin(shell, type);
 	if (type == SHELL_MSG_ERROR) {
-		snprintf(formatted, sizeof(formatted), "ERROR: %s", text);
+		log_write(shell, "ERROR: ", 7);
 	} else if (type == SHELL_MSG_WARN) {
-		snprintf(formatted, sizeof(formatted), "WARN: %s", text);
-	} else {
-		strncpy_safe(formatted, sizeof(formatted), text);
+		log_write(shell, "WARN: ", 6);
 	}
-
-	shell->last_output[0] = (unsigned char)type;
-	strncpy_safe(shell->last_output + 1, SHELL_OUTPUT_MAX - 1, formatted);
+	log_write(shell, text, strlen(text));
+	log_end(shell);
 	return 0;
 }
 
-int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WINDOW *shell_win) {
-	char cmd[SHELL_MAX_INPUT];
-	char expanded[SHELL_MAX_INPUT * 4];
-	int len;
-	const char *label;
-	char *endp;
-	long idx;
-	char target[PATH_MAX];
-	char resolved[PATH_MAX];
-	const char *use;
-	const char *cd_arg;
-	int found;
-	const char *p;
-	int is_rm;
-	int is_r;
-	const char *arg;
-	char display[SHELL_OUTPUT_MAX];
-	int dlen;
-	int any;
-	const char *scan;
-	const char *tok_end;
-	char token[MAX_FILENAME];
-	int tok_len;
-	int matched;
-	int was_quoted;
-	int removed;
-	int failed;
-	char sel_args[SHELL_MAX_INPUT * 3];
-	const char *srch;
-	char *dst;
-	int rem;
-	int n;
-	int overflow;
-
-	strncpy(cmd, shell->current_input, SHELL_MAX_INPUT - 1);
-	cmd[SHELL_MAX_INPUT - 1] = '\0';
-
-	if (files->sel_count > 0) {
-		overflow = files_build_sel_args(files, sel_args, sizeof(sel_args)) < 0;
-		srch = cmd;
-		dst = expanded;
-		rem = (int)sizeof(expanded) - 1;
-		while (*srch && rem > 0 && !overflow) {
-			if (strncmp(srch, "sel", 3) == 0 &&
-			    (srch == cmd || srch[-1] == ' ') &&
-			    (srch[3] == '\0' || srch[3] == ' ')) {
-				n = snprintf(dst, rem + 1, "%s", sel_args);
-				if (n < 0 || n > rem) {
-					overflow = 1;
-					break;
-				}
-				dst += n;
-				rem -= n;
-				srch += 3;
-			} else {
-				*dst++ = *srch++;
-				rem--;
-			}
-		}
-		*dst = '\0';
-		// Never run a command that was cut short, it could act on the wrong files
-		if (overflow || *srch != '\0' || strlen(expanded) >= SHELL_MAX_INPUT) {
-			print_to_shell(shell, "selection is too large to expand into the command line\n", SHELL_MSG_ERROR);
-			return 0;
-		}
-		memcpy(cmd, expanded, strlen(expanded) + 1);
-	}
-
-	len = (int)strlen(cmd);
-	while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) { cmd[--len] = '\0'; }
-
-	memset(shell->current_input, 0, SHELL_MAX_INPUT);
-	shell->input_pos = 0;
-	shell->history_index = -1;
-
-	if (len == 0) {
-		do_spawn(files->cwd, files_win, shell_win);
-		return 0;
-	}
-
-	strncpy(shell->last_cmd, cmd, SHELL_MAX_INPUT - 1);
-	shell->last_cmd[SHELL_MAX_INPUT - 1] = '\0';
-
-	label = lookup_label(cmd);
-	if (label) {
-		strncpy(shell->last_result, label, SHELL_RESULT_MAX - 1);
-		shell->last_result[SHELL_RESULT_MAX - 1] = '\0';
-	} else {
-		shell->last_result[0] = '\0';
-	}
-
-	shell_add_history(shell, cmd);
-
-	if (strcmp(cmd, "q") == 0) {
-		shell->quit_requested = 1;
-		return 0;
-	}
-
-	if (strcmp(cmd, "$jumplist") == 0) {
-		debug_print_jumplist(shell);
-		return 0;
-	}
-
-	if (strcmp(cmd, "$move") == 0) {
-		files_debug_print_move_register(files, shell);
-		return 0;
-	}
-
-	if (strcmp(cmd, "$undo") == 0) {
-		files_debug_print_undo_stack(files, shell);
-		return 0;
-	}
-
-	if (strcmp(cmd, "$redo") == 0) {
-		files_debug_print_redo_stack(files, shell);
-		return 0;
-	}
-
-	if (cmd[0] == 's' && (cmd[1] == '\0' || cmd[1] == ' ')) {
-		files_cmd_stat(files, shell, cmd[1] == ' ' ? cmd + 2 : "");
-		return 0;
-	}
-
-	if (strcmp(cmd, "..") == 0) {
-		return shell_jump_prev_dir(shell, files);
-	}
-
-	idx = strtol(cmd, &endp, 10);
-	if (*endp == '\0' && idx > 0) {
-		for (int i = 0; i < files->entry_count; i++) {
-			if (files->entries[i].index == (int)idx &&
-			    files->entries[i].type == ENTRY_DIR) {
-				if (strcmp(files->cwd, "/") == 0) {
-					snprintf(target, PATH_MAX, "/%.*s",
-					         (int)(PATH_MAX - 2), files->entries[i].name);
-				} else {
-					path_join(target, PATH_MAX, files->cwd, files->entries[i].name);
-				}
-				shell_push_dir(shell, files->cwd);
-				strncpy(shell->last_result, files->entries[i].name, SHELL_RESULT_MAX - 1);
-				shell->last_result[SHELL_RESULT_MAX - 1] = '\0';
-				use = realpath(target, resolved) ? resolved : target;
-				files_load_directory(files, use);
-				return 1;
-			}
-		}
-	}
-
-	cd_arg = parse_cd(cmd);
-	if (cd_arg != NULL) {
-		if (*cd_arg == '\0') {
-			const char *home = getenv("HOME");
-			snprintf(target, PATH_MAX, "%s", (home && home[0]) ? home : "/");
-		} else {
-			idx = strtol(cd_arg, &endp, 10);
-			if (*endp == '\0' && idx > 0) {
-				found = 0;
-				for (int i = 0; i < files->entry_count; i++) {
-					if (files->entries[i].index == (int)idx &&
-					    files->entries[i].type == ENTRY_DIR) {
-						if (strcmp(files->cwd, "/") == 0) {
-							snprintf(target, PATH_MAX, "/%.*s",
-							         (int)(PATH_MAX - 2), files->entries[i].name);
-						} else {
-							path_join(target, PATH_MAX, files->cwd, files->entries[i].name);
-						}
-						found = 1;
-						break;
-					}
-				}
-				if (!found) { return 0; }
-			} else if (cd_arg[0] == '~') {
-				const char *home = getenv("HOME");
-				if (!home) { home = "/"; }
-				snprintf(target, PATH_MAX, "%s%s", home, cd_arg + 1);
-			} else if (cd_arg[0] != '/') {
-				path_join(target, PATH_MAX, files->cwd, cd_arg);
-			} else {
-				snprintf(target, PATH_MAX, "%s", cd_arg);
-			}
-		}
-
-		use = realpath(target, resolved) ? resolved : target;
-		shell_push_dir(shell, files->cwd);
-		files_load_directory(files, use);
-		return 1;
-	}
-
-	p = cmd;
-	while (*p == ' ' || *p == '\t') { p++; }
-
-	// Match both "rm <args>" and "r <args>" as remove shorthand
-	is_rm = (strncmp(p, "rm", 2) == 0 && (p[2] == ' ' || p[2] == '\t'));
-	is_r  = (p[0] == 'r' && p[1] == ' ');
-
-	if (is_rm || is_r) {
-		arg = p + (is_rm ? 2 : 1);
-		while (*arg == ' ' || *arg == '\t') { arg++; }
-
-		if (!shell->rm_confirm_mode) {
-			// Phase 1 collect targets and ask for confirmation
-			dlen = 0;
-			any = 0;
-			scan = arg;
-
-			dlen += snprintf(display + dlen, sizeof(display) - dlen, "File(s) to be removed:\n");
-
-			while (*scan != '\0' && dlen < (int)sizeof(display) - 1) {
-				tok_end = scan;
-				while (*tok_end && *tok_end != ' ' && *tok_end != '\t') { tok_end++; }
-
-				tok_len = (int)(tok_end - scan);
-				if (tok_len >= MAX_FILENAME) { tok_len = MAX_FILENAME - 1; }
-				copy_span(token, sizeof(token), scan, (size_t)tok_len);
-
-				was_quoted = 0;
-				if (tok_len >= 2 && token[0] == '\'' && token[tok_len - 1] == '\'') {
-					memmove(token, token + 1, tok_len - 2);
-					token[tok_len - 2] = '\0';
-					was_quoted = 1;
-				}
-
-				scan = tok_end;
-				while (*scan == ' ' || *scan == '\t') { scan++; }
-
-				matched = 0;
-				if (!was_quoted) {
-					idx = strtol(token, &endp, 10);
-					if (*endp == '\0' && idx > 0) {
-						for (int i = 0; i < files->entry_count; i++) {
-							if (files->entries[i].index != (int)idx) { continue; }
-							dlen += snprintf(display + dlen, sizeof(display) - dlen, "  %s\n", files->entries[i].name);
-							any = 1;
-							matched = 1;
-							break;
-						}
-						if (!matched) {
-							print_to_shell(shell, "no entry at that index", SHELL_MSG_ERROR);
-							return 0;
-						}
-					}
-				}
-				if (!matched) {
-					for (int i = 0; i < files->entry_count; i++) {
-						if (strcmp(files->entries[i].name, token) != 0) { continue; }
-						dlen += snprintf(display + dlen, sizeof(display) - dlen, "  %s\n", files->entries[i].name);
-						any = 1;
-						break;
-					}
-				}
-			}
-
-			if (any) {
-				snprintf(display + dlen, sizeof(display) - dlen, "Continue? [y/N]");
-				print_to_shell(shell, display, 1);
-				shell->rm_confirm_mode = 1;
-				strncpy_safe(shell->rm_pending_cmd, SHELL_MAX_INPUT, cmd);
-				return 0;
-			}
-		} else {
-			// Phase 2 execute the deletions
-			shell->rm_confirm_mode = 0;
-			any = 0;
-			removed = 0;
-			failed = 0;
-			while (*arg != '\0') {
-				tok_end = arg;
-				while (*tok_end && *tok_end != ' ' && *tok_end != '\t') { tok_end++; }
-
-				tok_len = (int)(tok_end - arg);
-				if (tok_len >= MAX_FILENAME) { tok_len = MAX_FILENAME - 1; }
-				copy_span(token, sizeof(token), arg, (size_t)tok_len);
-
-				was_quoted = 0;
-				if (tok_len >= 2 && token[0] == '\'' && token[tok_len - 1] == '\'') {
-					memmove(token, token + 1, tok_len - 2);
-					token[tok_len - 2] = '\0';
-					was_quoted = 1;
-				}
-
-				arg = tok_end;
-				while (*arg == ' ' || *arg == '\t') { arg++; }
-
-				matched = -1;
-				if (!was_quoted) {
-					idx = strtol(token, &endp, 10);
-					if (*endp == '\0' && idx > 0) {
-						for (int i = 0; i < files->entry_count; i++) {
-							if (files->entries[i].index == (int)idx) {
-								matched = i;
-								break;
-							}
-						}
-					}
-				}
-				if (matched < 0) {
-					for (int i = 0; i < files->entry_count; i++) {
-						if (strcmp(files->entries[i].name, token) == 0) {
-							matched = i;
-							break;
-						}
-					}
-				}
-				if (matched < 0) { continue; }
-
-				any = 1;
-				if (rm_entry(files, matched) == 0) {
-					removed++;
-				} else {
-					failed++;
-				}
-			}
-			if (any) {
-				if (failed > 0) {
-					snprintf(display, sizeof(display), "rm: removed %d, failed to remove %d item(s)\n", removed, failed);
-					print_to_shell(shell, display, SHELL_MSG_ERROR);
-				} else {
-					snprintf(display, sizeof(display), "rm: removed %d item(s)\n", removed);
-					print_to_shell(shell, display, SHELL_MSG_NORMAL);
-				}
-				return 0;
-			}
-		}
-	}
-
-	run_shell(cmd, files->cwd, shell);
-	return 0;
-}
-
-void compute_ghost(const char *input, int input_pos, const char *cwd,
-                   const FilesBuffer *files, const ShellBuffer *shell,
-                   char *ghost_out, int ghost_max) {
-	int tok_start;
-	int tok_len;
-	char token[SHELL_MAX_INPUT];
-	int name_len;
-	int is_first_token;
-	int has_slash;
-	char *endp;
-	long idx;
-	const char *slash;
-	const char *dname;
-	char dir_part[PATH_MAX];
-	char name_part[MAX_FILENAME];
-	const char *last_slash;
-	char search_dir[PATH_MAX];
-	char completed[MAX_FILENAME];
-	int count;
-	int comp_len;
-
-	ghost_out[0] = '\0';
-	if (input_pos <= 0 || !cwd) { return; }
-
-	tok_start = input_pos;
-	while (tok_start > 0 && input[tok_start - 1] != ' ') { tok_start--; }
-
-	tok_len = input_pos - tok_start;
-	if (tok_len <= 0) { return; }
-
-	strncpy(token, input + tok_start, tok_len);
-	token[tok_len] = '\0';
-
-	name_len = tok_len;
-	is_first_token = (tok_start == 0);
-	has_slash = (strchr(token, '/') != NULL);
-
-	if (!is_first_token) { return; }
-
-	if (is_first_token && !has_slash) {
-		if (strcmp(token, "..") == 0) {
-			if (shell && shell->dir_jumplist_count > 0) {
-				const char *prev = shell->dir_jumplist[shell->dir_jumplist_count - 1];
-				slash = strrchr(prev, '/');
-				dname = (slash && slash[1] != '\0') ? slash + 1 : prev;
-				snprintf(ghost_out, ghost_max, " > %s", dname);
-			}
-			return;
-		}
-
-		idx = strtol(token, &endp, 10);
-		if (*endp == '\0' && idx > 0 && files) {
-			for (int i = 0; i < files->entry_count; i++) {
-				if (files->entries[i].index == (int)idx &&
-				    files->entries[i].type == ENTRY_DIR) {
-					snprintf(ghost_out, ghost_max, " > %s", files->entries[i].name);
-					return;
-				}
-			}
-		}
-
-		for (int i = 0; cmd_labels[i].cmd != NULL; i++) {
-			if (strcmp(cmd_labels[i].cmd, token) == 0) {
-				snprintf(ghost_out, ghost_max, " > %s", cmd_labels[i].label);
-				return;
-			}
-		}
-		return;
-	}
-
-	last_slash = strrchr(token, '/');
-	if (last_slash) {
-		int dlen = (int)(last_slash - token);
-		strncpy(dir_part, token, dlen);
-		dir_part[dlen] = '\0';
-		strncpy(name_part, last_slash + 1, MAX_FILENAME - 1);
-		name_part[MAX_FILENAME - 1] = '\0';
-		name_len = (int)strlen(name_part);
-	} else {
-		dir_part[0] = '\0';
-		strncpy(name_part, token, MAX_FILENAME - 1);
-		name_part[MAX_FILENAME - 1] = '\0';
-	}
-
-	if (name_len <= 0) { return; }
-
-	if (dir_part[0] == '\0') {
-		strncpy(search_dir, cwd, PATH_MAX - 1);
-		search_dir[PATH_MAX - 1] = '\0';
-	} else if (dir_part[0] == '/') {
-		strncpy(search_dir, dir_part, PATH_MAX - 1);
-		search_dir[PATH_MAX - 1] = '\0';
-	} else {
-		path_join(search_dir, PATH_MAX, cwd, dir_part);
-	}
-
-	count = complete_in_dir(search_dir, name_part, completed, sizeof(completed));
-	if (count == 0 || completed[0] == '\0') { return; }
-
-	comp_len = (int)strlen(completed);
-	if (comp_len <= name_len) { return; }
-
-	strncpy(ghost_out, completed + name_len, ghost_max - 1);
-	ghost_out[ghost_max - 1] = '\0';
-}
-
-void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused,
-                  const char *cwd, const FilesBuffer *files) {
+void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused, const char *ghost) {
 	int width;
 	int out_rows;
-	char buf[SHELL_OUTPUT_MAX];
-	const char *line_ptrs[1024];
+	const char *line_ptr[256];
+	int line_len[256];
+	char line_type[256];
 	int nlines;
-	int start;
+	int head;
+	int cur_type;
+	int len;
+	int pair;
+	int slot;
+	attr_t at;
+	const char *p;
+	const char *end;
+	const char *nl;
 	int result_row;
 	int cmd_cols;
 	int x;
 	int input_row;
-	char ghost[MAX_FILENAME];
 	int cx;
 
 	width = getmaxx(win);
@@ -880,46 +418,48 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused,
 	}
 	wclrtoeol(win);
 
+	// Keep the last out_rows lines in a ring while walking the log, carrying each message's type forward
 	out_rows = height - 3;
-	if (out_rows > 0 && shell->last_output[0] != '\0') {
-		strncpy(buf, shell->last_output, SHELL_OUTPUT_MAX - 1);
-		buf[SHELL_OUTPUT_MAX - 1] = '\0';
-
+	if (out_rows > 256) { out_rows = 256; }
+	if (out_rows > 0 && shell->output_len > 0) {
 		nlines = 0;
-		line_ptrs[nlines++] = buf;
-		for (char *p = buf; *p && nlines < 1024; p++) {
-			if (*p == '\n') {
-				*p = '\0';
-				if (*(p + 1) != '\0') { line_ptrs[nlines++] = p + 1; }
+		head = 0;
+		cur_type = SHELL_MSG_NORMAL;
+		p = shell->last_output;
+		end = shell->last_output + shell->output_len;
+		while (p < end) {
+			nl = memchr(p, '\n', (size_t)(end - p));
+			if (!nl) { nl = end; }
+			if (*p >= SHELL_MSG_NORMAL && *p <= SHELL_MSG_CMD) {
+				cur_type = *p;
+				p++;
 			}
+			line_ptr[head] = p;
+			line_len[head] = (int)(nl - p);
+			line_type[head] = (char)cur_type;
+			head = (head + 1) % out_rows;
+			if (nlines < out_rows) { nlines++; }
+			p = nl + 1;
 		}
-		start = (nlines > out_rows) ? nlines - out_rows : 0;
-		for (int i = start; i < nlines; i++) {
-			int row = 1 + (i - start);
-			const char *text = line_ptrs[i];
-			int pair = 0;
-			int bold = 0;
 
-			if (row >= height - 2) { break; }
-
-			wstandend(win);
-
-			if (text[0] == SHELL_MSG_ERROR) {
-				pair = CP_EXT_VIDEO;
-				bold = 1;
-				text++;
-			} else if (text[0] == SHELL_MSG_WARN) {
-				pair = CP_EXT_ARCHIVE;
-				bold = 1;
-				text++;
-			} else if (text[0] == SHELL_MSG_NORMAL) {
-				text++;
+		for (int i = 0; i < nlines; i++) {
+			slot = (head - nlines + i + out_rows) % out_rows;
+			at = A_NORMAL;
+			len = line_len[slot];
+			if (len > width - 2) {
+				len = width - 2;
+				while (len > 0 && (line_ptr[slot][len] & 0xC0) == 0x80) { len--; }
 			}
-
-			if (pair) { wattron(win, COLOR_PAIR(pair) | (bold ? A_BOLD : A_NORMAL)); }
-			mvwprintw(win, row, 1, "%.*s", width - 2, text);
-			if (pair) { wattroff(win, COLOR_PAIR(pair) | (bold ? A_BOLD : A_NORMAL)); }
-			wstandend(win);
+			pair = 0;
+			switch (line_type[slot]) {
+			case SHELL_MSG_ERROR: pair = CP_EXT_VIDEO; at = A_BOLD; break;
+			case SHELL_MSG_WARN: pair = CP_EXT_ARCHIVE; at = A_BOLD; break;
+			case SHELL_MSG_CMD: at = A_DIM; break;
+			default: break;
+			}
+			wattron(win, COLOR_PAIR(pair) | at);
+			mvwaddnstr(win, 1 + i, 1, line_ptr[slot], len);
+			wattroff(win, COLOR_PAIR(pair) | at);
 		}
 	}
 
@@ -944,35 +484,13 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused,
 	mvwaddstr(win, input_row, 1, "> ");
 	wattroff(win, COLOR_PAIR(CP_PROMPT) | A_BOLD);
 
-	if (shell->rm_confirm_mode) {
-		wattron(win, A_BOLD);
-		waddstr(win, "[y/N]: ");
-		wattroff(win, A_BOLD);
-		waddstr(win, shell->current_input);
-		wclrtoeol(win);
-		if (focused) {
-			cx = 3 + 7 + shell->input_pos;
-			wmove(win, input_row, cx);
-			leaveok(win, FALSE);
-			curs_set(2);
-		} else {
-			leaveok(win, TRUE);
-		}
-		wnoutrefresh(win);
-		return;
-	}
-
 	waddstr(win, shell->current_input);
 
-	if (focused) {
-		compute_ghost(shell->current_input, shell->input_pos, cwd,
-		              files, shell, ghost, sizeof(ghost));
-		if (ghost[0] != '\0') {
-			wclrtoeol(win);
-			wattron(win, A_DIM);
-			waddstr(win, ghost);
-			wattroff(win, A_DIM);
-		}
+	if (focused && ghost && ghost[0] != '\0') {
+		wclrtoeol(win);
+		wattron(win, A_DIM);
+		waddstr(win, ghost);
+		wattroff(win, A_DIM);
 	}
 
 	wclrtoeol(win);

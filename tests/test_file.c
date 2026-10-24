@@ -1,45 +1,18 @@
 #define _XOPEN_SOURCE 700
 
-#include "test.h"
-#include "../src/file.h"
-#include "../src/main.h"
-#include "../src/shell.h"
-
 #include <errno.h>
-#include <fcntl.h>
-#include <ftw.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int unlink_cb(const char *path, const struct stat *st, int type, struct FTW *ftwbuf);
-static void remove_tree(const char *path);
-static void write_file(const char *path);
-static void init_shell(ShellBuffer *shell);
-
-static int unlink_cb(const char *path, const struct stat *st, int type, struct FTW *ftwbuf) {
-	(void)st;
-	(void)type;
-	(void)ftwbuf;
-	return remove(path);
-}
-
-static void remove_tree(const char *path) {
-	nftw(path, unlink_cb, 16, FTW_DEPTH | FTW_PHYS);
-}
-
-static void write_file(const char *path) {
-	int fd;
-
-	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-	if (fd >= 0) {
-		close(fd);
-	}
-}
-
-static void init_shell(ShellBuffer *shell) {
-	memset(shell, 0, sizeof(*shell));
-}
+#include "test.h"
+#include "fixture.h"
+#include "../src/file.h"
+#include "../src/fs.h"
+#include "../src/movereg.h"
+#include "../src/ops.h"
+#include "../src/shell.h"
+#include "../src/util.h"
 
 void test_file() {
 	char root[] = "/tmp/quickfish-test-file-XXXXXX";
@@ -64,13 +37,13 @@ void test_file() {
 	CHECK(mkdir(path, 0755) == 0, "creates alpha directory");
 
 	path_join(path, sizeof(path), root, "alphabet");
-	write_file(path);
+	fixture_write_file(path, NULL);
 
 	path_join(path, sizeof(path), root, "alps");
-	write_file(path);
+	fixture_write_file(path, NULL);
 
 	path_join(path, sizeof(path), root, "beta");
-	write_file(path);
+	fixture_write_file(path, NULL);
 
 	count = complete_in_dir(root, "al", out, sizeof(out));
 	CHECK(count == 3, "counts all matching entries");
@@ -114,7 +87,7 @@ void test_file() {
 
 	SUITE("move register");
 
-	init_shell(&shell);
+	memset(&shell, 0, sizeof(shell));
 	files_load_directory(&files, root);
 	for (int i = 0; i < files.entry_count; i++) {
 		if (strcmp(files.entries[i].name, "alphabet") == 0) {
@@ -135,7 +108,7 @@ void test_file() {
 	SUITE("move paste and undo");
 
 	files_load_directory(&files, root);
-	init_shell(&shell);
+	memset(&shell, 0, sizeof(shell));
 	for (int i = 0; i < files.entry_count; i++) {
 		if (strcmp(files.entries[i].name, "alphabet") == 0) {
 			files_move_mark(&files, &shell, i);
@@ -164,7 +137,7 @@ void test_file() {
 	SUITE("move paste rejection");
 
 	files_load_directory(&files, root);
-	init_shell(&shell);
+	memset(&shell, 0, sizeof(shell));
 	for (int i = 0; i < files.entry_count; i++) {
 		if (strcmp(files.entries[i].name, "alpha") == 0) {
 			files_move_mark(&files, &shell, i);
@@ -177,5 +150,31 @@ void test_file() {
 	CHECK(strstr(shell.last_output + 1, "can't move 'alpha' into itself") != NULL,
 	      "self-move prints clear error");
 
-	remove_tree(root);
+	SUITE("large directories");
+
+	path_join(path, sizeof(path), root, "many");
+	mkdir(path, 0755);
+	for (int i = 0; i < 1500; i++) {
+		snprintf(out, sizeof(out), "f%04d", i);
+		path_join(src, sizeof(src), path, out);
+		fixture_write_file(src, NULL);
+	}
+	files_load_directory(&files, path);
+	CHECK(files.entry_count == 1500, "loads more than 1000 entries");
+	CHECK_STR(files.entries[1499].name, "f1499", "sorts every entry, not just the first 1000");
+
+	memset(&shell, 0, sizeof(shell));
+	files_move_clear(&files, &shell);
+	{ int all[1500]; for (int i = 0; i < files.entry_count; i++) { all[i] = i; } files_move_mark_entries(&files, &shell, all, files.entry_count); }
+	CHECK(files.move_reg.count == 1500, "move register holds more than 1000 entries");
+	CHECK(files.entries[0].in_move_reg && files.entries[1499].in_move_reg, "marked entries are flagged in the listing");
+	files_move_mark(&files, &shell, 0);
+	CHECK(files.move_reg.count == 1499 && !files.entries[0].in_move_reg, "unmarking removes one entry");
+	files_move_clear(&files, &shell);
+	CHECK(files.move_reg.count == 0 && !files.entries[1].in_move_reg, "clear empties the register");
+
+	files_free(&files);
+	CHECK(files.entries == NULL && files.entry_count == 0, "files_free releases the listing");
+
+	fixture_remove_tree(root);
 }

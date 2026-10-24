@@ -1,7 +1,7 @@
+#include <locale.h>
 #include <ncurses.h>
 #include <stdio.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "tui.h"
 
@@ -10,6 +10,8 @@ int main(int argc, char **argv) {
 	const char *start_dir;
 	TUI *tui;
 	int ch;
+
+	setlocale(LC_ALL, "");
 
 	if (argc > 1) {
 		if (stat(argv[1], &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -25,15 +27,18 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	// Only redraw after input or a resize, getch() timing out keeps idle wakeups cheap
 	while (tui->running) {
 		tui_resize_handler(tui);
-		tui_render(tui);
+		if (tui->dirty) {
+			tui_render(tui);
+			tui->dirty = 0;
+		}
 
 		ch = getch();
 		if (ch != ERR) {
 			tui_handle_input(tui, ch);
-		} else {
-			usleep(16000);
+			tui->dirty = 1;
 		}
 	}
 

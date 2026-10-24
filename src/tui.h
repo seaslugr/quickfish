@@ -31,21 +31,12 @@ typedef enum {
 } BufferType;
 
 /**
- * @brief Controls how a delete confirmation dialog handles the selected entry.
- */
-typedef enum {
-	DEL_NONE, ///< No delete operation pending
-	DEL_TRASH, ///< Move to trash
-	DEL_PERM, ///< Permanently delete (unrecoverable)
-} DeleteMode;
-
-/**
  * @brief Top-level state for the quickfish TUI.
  *
  * Owns all ncurses windows, overlay buffers, and references to the files
  * and shell subsystems. Allocated and initialised by tui_init().
  */
-typedef struct {
+typedef struct TUI {
 	char file_cmd_buf[FILE_CMD_BUF_MAX];
 	char goto_buf[GOTO_BUF_MAX];
 	char rename_buf[RENAME_BUF_MAX];
@@ -54,6 +45,7 @@ typedef struct {
 	int max_x, max_y;
 	int files_height, shell_height, divider_y;
 	int running;
+	int dirty;
 	int goto_mode;
 	int goto_len;
 	int rename_mode;
@@ -68,13 +60,14 @@ typedef struct {
 	int preview_saved_col_offset;
 	int file_cmd_len;
 	int visual_mode;
-	DeleteMode delete_confirm;
+	int rename_target;
 	BufferType active_buffer;
 	BufferType prev_buffer;
 	WINDOW *files_win;
 	WINDOW *shell_win;
 	WINDOW *info_win;
 	PANEL *info_panel;
+	int (*confirm)(struct TUI *tui, const char *body, const char *warning, int danger); ///< Asks yes/no, NULL always answers no
 	FilesBuffer files;
 	ShellBuffer shell;
 } TUI;
@@ -87,5 +80,13 @@ void tui_handle_input(TUI *tui, int ch);
 void tui_handle_files_input(TUI *tui, int ch);
 void tui_handle_preview_input(TUI *tui, int ch);
 void tui_handle_shell_input(TUI *tui, int ch);
+
+void tui_load_dir(TUI *tui, const char *path);
+void tui_change_dir(TUI *tui, const char *dirname);
+void tui_refresh_files(TUI *tui);
+void tui_select_name(TUI *tui, const char *name);
+void tui_set_preview(TUI *tui, int on);
+void tui_focus(TUI *tui, BufferType buffer);
+void tui_suspend(TUI *tui);
 
 extern volatile int needs_resize;

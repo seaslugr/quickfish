@@ -1,19 +1,17 @@
 #pragma once
 
 #include <limits.h>
-#include <ncurses.h>
+#include <stddef.h>
 #include <sys/stat.h>
 
-#include "colors.h"
+#include "util.h"
 
-#define MAX_FILENAME 256
-#define MAX_FILES 1000
 #define UNDO_MAX 50
-#define MOVE_REGISTER_MAX MAX_FILES
 
 typedef struct {
 	int count;
-	char paths[MOVE_REGISTER_MAX][PATH_MAX];
+	int cap;
+	char **paths;
 } MoveRegister;
 
 typedef enum {
@@ -29,6 +27,8 @@ typedef enum {
 } OpType;
 
 typedef struct {
+	char marked;
+	char in_move_reg;
 	int index;
 	int is_empty;
 	EntryType type;
@@ -52,23 +52,20 @@ typedef struct {
 	int sel_count;
 	int undo_top;
 	int redo_top;
-	int move_batch_id;
+	int batch_seq;
+	int entry_cap;
+	unsigned load_gen;
+	DirEntry *entries;
+	MoveRegister move_reg;
 	char cwd[PATH_MAX];
-	DirEntry entries[MAX_FILES];
-	int multi_sel[MAX_FILES];
-	int in_move_reg[MAX_FILES];
 	UndoOp undo_stack[UNDO_MAX];
 	UndoOp redo_stack[UNDO_MAX];
-	MoveRegister move_reg;
 } FilesBuffer;
 
 struct ShellBuffer;
 
-int dir_is_empty(const char *path);
-int path_exists(const char *path);
-int path_remove_tree(const char *path);
-int path_move(const char *src, const char *dst);
 void files_load_directory(FilesBuffer *files, const char *path);
+void files_free(FilesBuffer *files);
 void files_sort_entries(FilesBuffer *files);
 void files_select_next(FilesBuffer *files);
 void files_select_next_n(FilesBuffer *files, int n);
@@ -76,31 +73,11 @@ void files_select_prev(FilesBuffer *files);
 void files_select_prev_n(FilesBuffer *files, int n);
 void files_change_dir(FilesBuffer *files, const char *dirname);
 int files_get_selected_path(FilesBuffer *files, char *out_path, size_t out_size);
-void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int focused);
 
-int complete_in_dir(const char *dir, const char *prefix, char *out, int out_size);
-
-int entry_color_pair(const DirEntry *e, int selected);
-void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *arg);
 void refresh_files_buffer(FilesBuffer *files);
 
-void files_open_selected(FilesBuffer *files, struct ShellBuffer *shell, WINDOW *files_win, WINDOW *shell_win);
-
 void files_toggle_select(FilesBuffer *files, int idx);
+void files_select_add(FilesBuffer *files, int idx);
 void files_clear_selection(FilesBuffer *files);
-void files_delete_to_trash(FilesBuffer *files, struct ShellBuffer *shell);
-void files_delete_permanent(FilesBuffer *files, struct ShellBuffer *shell);
-void files_undo(FilesBuffer *files, struct ShellBuffer *shell);
-void files_redo(FilesBuffer *files, struct ShellBuffer *shell);
-void files_debug_print_undo_stack(FilesBuffer *files, struct ShellBuffer *shell);
-void files_debug_print_redo_stack(FilesBuffer *files, struct ShellBuffer *shell);
 int files_build_sel_args(FilesBuffer *files, char *out, int out_size);
 
-void files_move_mark(FilesBuffer *files, struct ShellBuffer *shell, int idx);
-void files_move_mark_all(FilesBuffer *files, struct ShellBuffer *shell);
-void files_move_clear(FilesBuffer *files, struct ShellBuffer *shell);
-void files_move_paste(FilesBuffer *files, struct ShellBuffer *shell, const char *dest);
-void files_debug_print_move_register(FilesBuffer *files, struct ShellBuffer *shell);
-void push_undo(FilesBuffer *files, UndoOp op);
-
-extern volatile int needs_resize;

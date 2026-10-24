@@ -5,20 +5,22 @@
 int tests_passed = 0;
 int tests_failed = 0;
 
-void test_main();
+void test_util();
 void test_file();
 void test_shell();
 void test_safety();
+void test_command();
 
 int main() {
 	int total;
 
 	printf("\nrunning quickfish tests\n");
 
-	test_main();
+	test_util();
 	test_file();
 	test_shell();
 	test_safety();
+	test_command();
 
 	total = tests_passed + tests_failed;
 	if (tests_failed == 0) {

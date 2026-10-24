@@ -6,7 +6,24 @@
 - add the Operation Buffer
 - add proper comments and documentation to all files
 - hold down "s" to "drag select"
-- Everything is a command system. We start with a command, like "rename" or "delete" then theres an alias for it that's a keybind. Like r or D
+- copy files (only move exists right now)
+- toggle for showing hidden files
+- write `.trashinfo` files when trashing, so desktop trash apps can see and restore what quickfish trashed (FreeDesktop trash spec)
+- scrollback for the shell buffer log (it only shows the newest lines)
+- CI that runs `make test` and `make rel`
+
+## Bugs
+- opening files: `Exec=` is cut at the first space (breaks `flatpak run ...`, `env ...`), system `.desktop` dirs are searched before `~/.local`, `XDG_DATA_DIRS` is ignored, and `$EDITOR` is almost never used
+- opening a file with xdg-open can leave a zombie process (the intermediate child is reaped with `WNOHANG`)
+- interactive shell buffer commands (`less`, `vim`, `sudo` password prompts) hang the UI, since output is piped and the terminal is still in curses mode
+- Ctrl+C can't interrupt a long-running shell buffer command (we're in raw mode)
+- bat previews and `s` on a big directory block the UI (see the threading TODO)
+- a failed undo still moves the op to the redo stack, so it's gone from undo
+- visual mode with Ctrl+D/U only selects the entry it lands on, not the ones it skipped over
+- `s` (stat) shows disk usage for directories but byte size for files
+- rename, goto and shell input are ASCII only, and backspace deletes one byte, which breaks names with accents
+- file preview lines are cut by bytes, not columns
+- Full UTF-8 support
 
 ## ideas
 - add image preview via some in terminal image renderer (find it out later)
@@ -31,8 +48,9 @@
 - Action Pipelines. Build pipelines like "compress > move > rename"
 - Built in file conversion TUI. Would use ffmpeg as a backend (optinaly)
 - Binary inspector via a hex view
-- Rename file shell command ("r"?)
-- Context-aware shell. You can use the sel alias (and "r" rename, if we add that) like "r sel.ext png" to rename all the selections file extentions to "png". We would also add "cur" for current file, "cwd" for current directory, and subsections for each (like "cwd.build/" for `<cwd>/build/`)
+- Context-aware shell, part two. `sel`, `cur` and `all` work as targets and expand in system commands now. Still to do: bulk rename like "r sel.ext png" to change every selected extension, a `cwd` word, and subsections (like "cwd.build/" for `<cwd>/build/`)
+- keybinds from a config file (the keymap is already one table of key -> command line, so this is mostly parsing)
+- targets outside the current directory (`trash ../foo`), and index ranges (`trash 3-7`)
 - Command templates "template compress = tar -czf {dir}.tar.gz {dir}" then use it with "compress sel" in the shell buffer
 - Quick Fuzzy search ("/" in file buffer?)
 - Quickview trash buffer (view whats been put into the trash by quickfish)
