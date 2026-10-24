@@ -54,14 +54,6 @@ The install prefix defaults to `/usr/local`. Override it with `PREFIX`:
 sudo make install PREFIX=/usr
 ```
 
-## Building the Documentation
-
-Code documentation is generated with [Doxygen](https://www.doxygen.nl/):
-```bash
-make docs
-# Output placed in docs/doxygen/
-```
-
 ## Cleaning Build Artifacts
 
 ```bash

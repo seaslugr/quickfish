@@ -21,7 +21,7 @@ THEME_OBJ_REL = $(THEMES:themes/%.swt=$(REL_BUILDDIR)/themes_%.o)
 TOTAL = $(shell echo $$(($(words $(SRC)) + $(words $(THEMES)) + 2)))
 WIDTH = $(shell echo $$(($(TOTAL)<10?1:$(TOTAL)<100?2:3)))
 
-.PHONY: dev rel test clean install uninstall docs
+.PHONY: dev rel test clean install uninstall
 
 dev: $(DEV_BUILDDIR)/quickfish
 
@@ -96,8 +96,3 @@ uninstall:
 
 clean:
 	rm -rf $(DEV_BUILDDIR) $(REL_BUILDDIR) $(TEST_BUILDDIR)
-
-docs:
-	@echo "Building doxygen docs..."
-	doxygen Doxyfile
-	@echo "Documentation generated in docs/doxygen"
